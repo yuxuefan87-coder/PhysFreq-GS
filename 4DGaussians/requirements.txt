@@ -1,0 +1,6 @@
+matplotlib
+argparse
+lpips
+plyfile
+open3d
+imageio[ffmpeg]
