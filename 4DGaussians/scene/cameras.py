@@ -36,7 +36,14 @@ class Camera(nn.Module):
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
+        # 截取 RGB 并防止梯度污染
         self.original_image = image.clamp(0.0, 1.0)[:3,:,:]
+        
+        # [PI-SGLM 掩码截留]: 剥离第 4 通道作为静态背景权重，存为单通道 Tensor [1, H, W]
+        if image.shape[0] == 4:
+            self.static_mask = image[3:, :, :].clamp(0.0, 1.0)
+        else:
+            self.static_mask = torch.ones_like(self.original_image[:1, :, :])
         # breakpoint()
         # .to(self.data_device)
         self.image_width = self.original_image.shape[2]

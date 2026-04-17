@@ -42,7 +42,13 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         self.video_cameras = {}
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        # --- PI-SGLM 数据加载劫持点开始 ---
+        if os.path.exists(os.path.join(args.source_path, "cameras.json")):
+            print("[PI-SGLM] Detected custom industrial binocular prior. Hijacking loader...")
+            # 调用我们在 scene/dataset_readers.py 中自定义的底层解析算子
+            scene_info = sceneLoadTypeCallbacks["PISGLM"](args.source_path, args.white_background, args.eval)
+            dataset_type="PISGLM"
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.llffhold)
             dataset_type="colmap"
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
@@ -62,7 +68,8 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["MultipleView"](args.source_path)
             dataset_type="MultipleView"
         else:
-            assert False, "Could not recognize scene type!"
+            assert False, "Could not recognize scene type! Ensure cameras.json exists for PI-SGLM."
+        # --- PI-SGLM 数据加载劫持点结束 ---
         self.maxtime = scene_info.maxtime
         self.dataset_type = dataset_type
         self.cameras_extent = scene_info.nerf_normalization["radius"]
