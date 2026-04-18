@@ -44,6 +44,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                          gaussians, scene, stage, tb_writer, train_iter,timer):
     first_iter = 0
 
+    # [PI-SGLM] 创建实时监控目录
+    render_preview_path = os.path.join(args.model_path, "previews")
+    os.makedirs(render_preview_path, exist_ok=True)
+
     gaussians.training_setup(opt)
     if checkpoint:
         # breakpoint()
@@ -270,6 +274,28 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             loss += opt.lambda_dssim * (1.0-ssim_loss)
             
         loss.backward()
+
+        # ========== [PI-SGLM 实时监控快门] ==========
+        if iteration % 500 == 0:
+            with torch.no_grad():
+                # 随机抓取一张相机快照
+                check_cam = viewpoint_stack[iteration % len(viewpoint_stack)]
+                
+                # 注入当前相机的物理时间戳
+                if hasattr(gaussians, 'set_time'):
+                    gaussians.set_time(check_cam.time)
+                
+                # 调用渲染器生成预览图
+                preview_pkg = render(check_cam, gaussians, pipe, background, stage=stage)
+                preview_img = torch.clamp(preview_pkg["render"], 0.0, 1.0)
+                
+                # 将 Tensor 转回 CPU 图片并保存
+                from torchvision.utils import save_image
+                img_name = f"iter_{stage}_{iteration:05d}_t{check_cam.time:.2f}.png"
+                save_image(preview_img, os.path.join(render_preview_path, img_name))
+                #print(f"\n[PI-SGLM Monitor] 预览图已保存: {img_name}")
+        # ============================================
+
         # ========== PI-SGLM 核心重构完毕 ==========
         if torch.isnan(loss).any():
             print("loss is nan,end training, reexecv program now.")
