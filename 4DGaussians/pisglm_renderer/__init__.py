@@ -12,7 +12,7 @@
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
+from scene.gaussian_model_pisglm import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
 
@@ -55,29 +55,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         shs_static = torch.cat([pc._features_dc_static, pc._features_rest_static], dim=1)
         
         # 预留 Phase 3 接口: 如果启用了解析 DCT 频域轨迹
-        if hasattr(pc, 'calculate_dct_deformation'):
-            deformed_xyz_dynamic = pc.calculate_dct_deformation(time_scalar)
-            deformed_scales_dynamic = pc._scaling_dynamic
-            deformed_rotations_dynamic = pc._rotation_dynamic
-            deformed_opacity_dynamic = pc._opacity_dynamic
-            deformed_shs_dynamic = torch.cat([pc._features_dc_dynamic, pc._features_rest_dynamic], dim=1)
-            
-        # 兼容 Phase 2 测试: MLP 网格 (仅喂入动态点)
-        else:
-            time_tensor = torch.tensor(time_scalar).to(pc._xyz_dynamic.device).repeat(pc._xyz_dynamic.shape[0], 1)
-            shs_dynamic = torch.cat([pc._features_dc_dynamic, pc._features_rest_dynamic], dim=1)
-            
-            if "fine" in stage:
-                deformed_xyz_dynamic, deformed_scales_dynamic, deformed_rotations_dynamic, deformed_opacity_dynamic, deformed_shs_dynamic = pc._deformation(
-                    pc._xyz_dynamic, pc._scaling_dynamic, pc._rotation_dynamic, pc._opacity_dynamic, shs_dynamic, time_tensor
-                )
-            else:
-                deformed_xyz_dynamic = pc._xyz_dynamic
-                deformed_scales_dynamic = pc._scaling_dynamic
-                deformed_rotations_dynamic = pc._rotation_dynamic
-                deformed_opacity_dynamic = pc._opacity_dynamic
-                deformed_shs_dynamic = shs_dynamic
-
+        # ========== PI-SGLM: 焊死 PI-DCT 物理路由 ==========
+        # 提取静态常量 (永远不进入时序形变)
+        shs_static = torch.cat([pc._features_dc_static, pc._features_rest_static], dim=1)
+        
+        # 直接调用模型层重构的 PI-DCT 频域算子，计算坐标形变
+        deformed_xyz_dynamic = pc.compute_dct_deformation(time_scalar)
+        
+        # 对于工业机械臂（刚体/铰接体），缩放、旋转、不透明度和颜色不随时间发生内质形变，直接透传参数
+        deformed_scales_dynamic = pc._scaling_dynamic
+        deformed_rotations_dynamic = pc._rotation_dynamic
+        deformed_opacity_dynamic = pc._opacity_dynamic
+        deformed_shs_dynamic = torch.cat([pc._features_dc_dynamic, pc._features_rest_dynamic], dim=1)
+        # ===================================================
+        
         # --- B. ConcatBackward 零内存开销拼接 ---
         means3D_final = torch.cat([pc._xyz_static, deformed_xyz_dynamic], dim=0)
         scales_final = torch.cat([pc._scaling_static, deformed_scales_dynamic], dim=0)
@@ -97,9 +88,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         if "coarse" in stage:
             means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
         elif "fine" in stage:
-            means3D_final, scales_final, rotations_final, opacity_final, shs_final = pc._deformation(
-                means3D, scales, rotations, opacity, shs, time_tensor
-            )
+            # ========== [PI-SGLM 渲染旁路劫持] ==========
+            # 彻底废弃旧版黑盒 MLP。
+            # 由于我们已经在 gaussian_model_pisglm.py 的 @property 中注入了 PI-DCT 算子，
+            # 此处直接进行无脑透传，由底层的 sglm_activated 状态锁来决定是否发生形变！
+            means3D_final = means3D
+            scales_final = scales
+            rotations_final = rotations
+            opacity_final = opacity
+            shs_final = shs
+        # ============================================
         else:
             raise NotImplementedError
     # ==========================================

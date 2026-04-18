@@ -62,6 +62,14 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self._deformation_table = torch.empty(0)
         self.setup_functions()
+        # [PI-SGLM 新增] 状态锁与物理频域参数
+        self.sglm_activated = False 
+        self.current_time = 0.0     
+        self.K = 5                  
+
+    def set_time(self, time: float):
+        """ 渲染前一瞬，截获当前时间戳 """
+        self.current_time = time
 
     def capture(self):
         return (
@@ -107,26 +115,31 @@ class GaussianModel:
 
     @property
     def get_scaling(self):
-        # 零开销拼接 ConcatBackward
+        if not self.sglm_activated: return self.scaling_activation(self._scaling)
         return self.scaling_activation(torch.cat([self._scaling_static, self._scaling_dynamic], dim=0))
     
     @property
     def get_rotation(self):
+        if not self.sglm_activated: return self.rotation_activation(self._rotation)
         return self.rotation_activation(torch.cat([self._rotation_static, self._rotation_dynamic], dim=0))
     
     @property
     def get_xyz(self):
-        # 注意：此处返回的是未形变的基础坐标，后续将在 train.py 中注入形变
-        return torch.cat([self._xyz_static, self._xyz_dynamic], dim=0)
+        if not self.sglm_activated: return self._xyz
+        # 奇点之后：静态点定死，动态点进入 PI-DCT 频域算子实时形变
+        deformed_dynamic = self.compute_dct_deformation(self.current_time)
+        return torch.cat([self._xyz_static, deformed_dynamic], dim=0)
 
     @property
     def get_features(self):
+        if not self.sglm_activated: return torch.cat((self._features_dc, self._features_rest), dim=1)
         features_dc = torch.cat([self._features_dc_static, self._features_dc_dynamic], dim=0)
         features_rest = torch.cat([self._features_rest_static, self._features_rest_dynamic], dim=0)
         return torch.cat((features_dc, features_rest), dim=1)
     
     @property
     def get_opacity(self):
+        if not self.sglm_activated: return self.opacity_activation(self._opacity)
         return self.opacity_activation(torch.cat([self._opacity_static, self._opacity_dynamic], dim=0))
     
     def get_covariance(self, scaling_modifier = 1):
@@ -136,16 +149,13 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, time_line: int, mask_path="data/dynamic_mask_3d.pt"):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, time_line: int):
         self.spatial_lr_scale = spatial_lr_scale
-        
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
-
-        print("[PI-SGLM] 初始点云规模: ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
@@ -153,73 +163,39 @@ class GaussianModel:
         rots[:, 0] = 1
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
-        # --- PI-SGLM: SGLM 底层物理拆分引擎 ---
-        if os.path.exists(mask_path):
-            print(f"[PI-SGLM] 加载动静物理掩码: {mask_path}")
-            dynamic_mask = torch.load(mask_path).cuda()
-        else:
-            raise FileNotFoundError(f"未找到掩码文件 {mask_path}，请先执行 Phase 1 的投影脚本！")
+        # 前 3000 步：统一注册为标准参数，绝对不要提前拆分
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         
-        static_mask = ~dynamic_mask
+        # [PI-SGLM 防爆补丁] 强行对齐原版 Densify 逻辑依赖的形变特征位，使其驻留 CUDA
+        self._deformation_table = torch.zeros((self._xyz.shape[0]), device="cuda", dtype=torch.bool)
+        self._deformation_accum = torch.zeros((self._xyz.shape[0], 3), device="cuda")
 
-        # 1. 静态背景池 (永不进入时序 MLP/DCT)
-        self._xyz_static = nn.Parameter(fused_point_cloud[static_mask].requires_grad_(True))
-        self._features_dc_static = nn.Parameter(features[static_mask,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest_static = nn.Parameter(features[static_mask,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling_static = nn.Parameter(scales[static_mask].requires_grad_(True))
-        self._rotation_static = nn.Parameter(rots[static_mask].requires_grad_(True))
-        self._opacity_static = nn.Parameter(opacities[static_mask].requires_grad_(True))
-
-        # 2. 动态前景池 (后续接入 PI-DCT)
-        self._xyz_dynamic = nn.Parameter(fused_point_cloud[dynamic_mask].requires_grad_(True))
-        self._features_dc_dynamic = nn.Parameter(features[dynamic_mask,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest_dynamic = nn.Parameter(features[dynamic_mask,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._scaling_dynamic = nn.Parameter(scales[dynamic_mask].requires_grad_(True))
-        self._rotation_dynamic = nn.Parameter(rots[dynamic_mask].requires_grad_(True))
-        self._opacity_dynamic = nn.Parameter(opacities[dynamic_mask].requires_grad_(True))
-        
-        # 形变表与累加器现在仅为动态点服务，极大节省显存
-        self.max_radii2D = torch.zeros((fused_point_cloud.shape[0]), device="cuda")
-        self._deformation_table = torch.gt(torch.ones((self._xyz_dynamic.shape[0]),device="cuda"),0) 
-        
-        print(f"[PI-SGLM VRAM Monitor] 物理隔离完毕. 静态点: {self._xyz_static.shape[0]} | 动态点: {self._xyz_dynamic.shape[0]}")
-        
-        # 兼容旧代码，但后续不再使用
-        self._deformation = self._deformation.to("cuda")
-        
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        total_points = self._xyz_static.shape[0] + self._xyz_dynamic.shape[0]
-        self.xyz_gradient_accum = torch.zeros((total_points, 1), device="cuda")
-        self.denom = torch.zeros((total_points, 1), device="cuda")
-        # 形变累加器仅注册动态维度
-        self._deformation_accum = torch.zeros((self._xyz_dynamic.shape[0],3),device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self._xyz_static, self._xyz_dynamic], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
-            {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid"},
-            {'params': [self._features_dc_static, self._features_dc_dynamic], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest_static, self._features_rest_dynamic], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity_static, self._opacity_dynamic], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling_static, self._scaling_dynamic], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation_static, self._rotation_dynamic], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         
-        # 学习率调度器保持不变
+        # 学习率调度器
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)
-        self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)    
-        self.grid_scheduler_args = get_expon_lr_func(lr_init=training_args.grid_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.grid_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.deformation_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
@@ -602,3 +578,79 @@ class GaussianModel:
         return total
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+
+    def execute_sglm_cold_start(self):
+        print("\n[PI-SGLM] Reaching Singularity! 执行计算图物理硬斩断与 DCT 频域冷启动...")
+        
+        # 1. 封印规范空间：将前 3000 步收敛出的几何体全部标记为静态，剥离 Autograd 树
+        self._xyz_static = self._xyz.detach().clone()
+        self._features_dc_static = self._features_dc.detach().clone()
+        self._features_rest_static = self._features_rest.detach().clone()
+        self._scaling_static = self._scaling.detach().clone()
+        self._rotation_static = self._rotation.detach().clone()
+        self._opacity_static = self._opacity.detach().clone()
+
+        # 释放 80% 显存压力的核心：斩断反向传播
+        self._xyz_static.requires_grad_(False)
+        self._features_dc_static.requires_grad_(False)
+        self._features_rest_static.requires_grad_(False)
+        self._scaling_static.requires_grad_(False)
+        self._rotation_static.requires_grad_(False)
+        self._opacity_static.requires_grad_(False)
+
+        # 2. 动态点冷启动 (抛洒机械臂的初始锚点)
+        num_dynamic = 20000
+        dyn_xyz = torch.rand((num_dynamic, 3), device="cuda") * 2.0 - 1.0 
+        
+        self._xyz_dynamic = nn.Parameter(dyn_xyz.requires_grad_(True))
+        self._features_dc_dynamic = nn.Parameter(torch.zeros((num_dynamic, 1, 3), device="cuda").requires_grad_(True))
+        self._features_rest_dynamic = nn.Parameter(torch.zeros((num_dynamic, 15, 3), device="cuda").requires_grad_(True))
+        self._scaling_dynamic = nn.Parameter(torch.ones((num_dynamic, 3), device="cuda").requires_grad_(True) * -3.0) 
+        self._rotation_dynamic = nn.Parameter(torch.zeros((num_dynamic, 4), device="cuda").requires_grad_(True))
+        self._rotation_dynamic.data[:, 0] = 1.0
+        self._opacity_dynamic = nn.Parameter(torch.zeros((num_dynamic, 1), device="cuda").requires_grad_(True))
+
+        # 3. 核心：初始化 PI-DCT 频域运动系数矩阵 [N_dyn, K, 3]
+        self._dct_coefs = nn.Parameter(torch.zeros((num_dynamic, self.K, 3), device="cuda").requires_grad_(True))
+
+        # 4. 重构优化器：仅将动态点和 DCT 系数交由 Adam 追踪
+        l = [
+            {'params': [self._xyz_dynamic], 'lr': 0.00016, "name": "xyz"},
+            {'params': [self._dct_coefs], 'lr': 0.001, "name": "dct_coefs"},
+            {'params': [self._features_dc_dynamic], 'lr': 0.0025, "name": "f_dc"},
+            {'params': [self._features_rest_dynamic], 'lr': 0.0001, "name": "f_rest"},
+            {'params': [self._opacity_dynamic], 'lr': 0.05, "name": "opacity"},
+            {'params': [self._scaling_dynamic], 'lr': 0.005, "name": "scaling"},
+            {'params': [self._rotation_dynamic], 'lr': 0.001, "name": "rotation"}
+        ]
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        
+        self.sglm_activated = True
+        print(f"[PI-SGLM] 物理截断完毕。静态锚点: {self._xyz_static.shape[0]} | DCT 频域节点: {num_dynamic}")
+
+    def compute_dct_deformation(self, t: float):
+        # omega_k 频率基：[1*pi, 2*pi, ..., K*pi]
+        k_indices = torch.arange(1, self.K + 1, device="cuda", dtype=torch.float32)
+        omega_k = k_indices * 3.14159265
+        
+        cos_bases = torch.cos(omega_k * t)
+        
+        # 张量乘加：零 Autograd 冗余的极致形变
+        deformation = torch.sum(self._dct_coefs * cos_bases.view(1, self.K, 1), dim=1)
+        return self._xyz_dynamic + deformation
+
+    def compute_analytical_pde_loss(self, t: float):
+        if not self.sglm_activated:
+            return 0.0
+            
+        k_indices = torch.arange(1, self.K + 1, device="cuda", dtype=torch.float32)
+        omega_k = k_indices * 3.14159265
+        
+        # 二阶导数基底: - (omega_k)^2 * cos(omega_k * t)
+        accel_bases = - (omega_k ** 2) * torch.cos(omega_k * t)
+        
+        # 加速度张量 [N, 3]
+        acceleration = torch.sum(self._dct_coefs * accel_bases.view(1, self.K, 1), dim=1)
+        
+        # 牛顿物理阻尼平滑项
+        return torch.mean(acceleration ** 2)

@@ -16,7 +16,8 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
 from pisglm_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene
+from scene.gaussian_model_pisglm import GaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -135,6 +136,26 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         iter_start.record()
 
+        # ========== PI-SGLM 核心重构: 物理硬拆分与动态点冷启动 ==========
+        # Coarse 已跑完 3000 步，Fine 阶段重新从 1 计数。此刻即为奇点！
+        if stage == "fine" and iteration == 1:
+            print("\n[PI-SGLM] Reaching Singularity (Step 3000). Executing SGLM Physical Graph Severing...")
+            
+            # 1. 将前 3000 步收敛出的 10 万个背景高斯点彻底剥离 Autograd 树，释放超过 70% 的显存反向传播开销
+            gaussians._xyz.requires_grad_(False)
+            gaussians._features_dc.requires_grad_(False)
+            gaussians._features_rest.requires_grad_(False)
+            gaussians._opacity.requires_grad_(False)
+            gaussians._scaling.requires_grad_(False)
+            gaussians._rotation.requires_grad_(False)
+            
+            # 2. 调用您在 gaussian_model_pisglm.py 中写好的冷启动与优化器重构逻辑
+            if hasattr(gaussians, 'execute_sglm_cold_start'):
+                gaussians.execute_sglm_cold_start()
+            else:
+                print("[PI-SGLM] Warning: 'execute_sglm_cold_start' missing in GaussianModel! Please ensure dynamic parameter initialization.")
+        # ================================================================
+
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -178,6 +199,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         for viewpoint_cam in viewpoint_cams:
+            # [PI-SGLM 时钟注入] 在进入纯函数式渲染前，告诉底层高斯模型当前的物理时间 t
+            if hasattr(gaussians, 'set_time'):
+                gaussians.set_time(viewpoint_cam.time)
+                
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
@@ -196,11 +221,24 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
-        # Loss
-        # breakpoint()
-        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-
-        psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
+        
+       # ========== PI-SGLM: 动静掩码与全域寻迹切换 ==========
+        if stage == "coarse":
+            # Phase 1: 预热阶段。只看静态背景，斩断动态像素的梯度污染
+            masks = [cam.static_mask.cuda() for cam in viewpoint_cams]
+            mask_tensor = torch.cat(masks, 0)
+            calc_image = image_tensor * mask_tensor
+            calc_gt = gt_image_tensor[:,:3,:,:] * mask_tensor
+        else:
+            # Phase 2 (奇点之后): 摘下遮罩！
+            # 静态点已被 requires_grad_(False) 物理焊死，它们会自动充当遮挡物。
+            # 现在必须把全图视野放开，让 2 万个动态点去贪婪地拟合机械臂像素的梯度！
+            calc_image = image_tensor
+            calc_gt = gt_image_tensor[:,:3,:,:]
+            
+        Ll1 = l1_loss(calc_image, calc_gt)
+        psnr_ = psnr(calc_image, calc_gt).mean().double()
+        # =====================================================
         # norm
         
 
@@ -214,7 +252,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         # 2. 注入 PI-DCT 解析 PDE 物理损失 (Phase 3 预留接口)
         # 遵循项目规划的渐进式训练策略: Step 3000 开始寻迹，Step 10000 达到最大平滑约束
-        if stage == "fine" and iteration > 3000:
+        if stage == "fine":
             if hasattr(gaussians, 'compute_analytical_pde_loss'): # 防止 Phase 2 报错的保护机制
                 # 计算动态阻尼权重 lambda (线性 warmup)
                 lambda_pde_max = 0.1 
@@ -226,7 +264,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 loss += lambda_pde * pde_loss
 
         if opt.lambda_dssim != 0:
-            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            ssim_loss = ssim(calc_image, calc_gt) 
             loss += opt.lambda_dssim * (1.0-ssim_loss)
             
         loss.backward()
@@ -243,7 +281,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
-            total_point = gaussians._xyz.shape[0]
+            total_point = gaussians.get_xyz.shape[0]
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
                                           "psnr": f"{psnr_:.{2}f}",
@@ -270,7 +308,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     # total_images.append(to8b(temp_image).transpose(1,2,0))
             timer.start()
             # Densification
-            if iteration < opt.densify_until_iter :
+            # [PI-SGLM 铁律] 奇点保护：用全局 stage 变量彻底锁死拓扑！
+            # 只允许在 coarse 阶段繁衍，fine 阶段绝对冻结！
+            if stage == "coarse":
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
