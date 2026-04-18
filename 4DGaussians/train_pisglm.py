@@ -222,23 +222,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
         
-       # ========== PI-SGLM: 动静掩码与全域寻迹切换 ==========
-        if stage == "coarse":
-            # Phase 1: 预热阶段。只看静态背景，斩断动态像素的梯度污染
-            masks = [cam.static_mask.cuda() for cam in viewpoint_cams]
-            mask_tensor = torch.cat(masks, 0)
-            calc_image = image_tensor * mask_tensor
-            calc_gt = gt_image_tensor[:,:3,:,:] * mask_tensor
-        else:
-            # Phase 2 (奇点之后): 摘下遮罩！
-            # 静态点已被 requires_grad_(False) 物理焊死，它们会自动充当遮挡物。
-            # 现在必须把全图视野放开，让 2 万个动态点去贪婪地拟合机械臂像素的梯度！
-            calc_image = image_tensor
-            calc_gt = gt_image_tensor[:,:3,:,:]
-            
+        # ========== PI-SGLM: 全域寻迹解锁 ==========
+        # 彻底废除掩码！让 Coarse 阶段看到移动的机械臂，从而在空间中生成一团“模糊的运动外壳”。
+        calc_image = image_tensor
+        calc_gt = gt_image_tensor[:,:3,:,:]
+        
         Ll1 = l1_loss(calc_image, calc_gt)
         psnr_ = psnr(calc_image, calc_gt).mean().double()
-        # =====================================================
+        # ============================================
         # norm
         
 
@@ -264,7 +255,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 loss += lambda_pde * pde_loss
 
         if opt.lambda_dssim != 0:
-            ssim_loss = ssim(calc_image, calc_gt) 
+            ssim_loss = ssim(calc_image, calc_gt)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
             
         loss.backward()

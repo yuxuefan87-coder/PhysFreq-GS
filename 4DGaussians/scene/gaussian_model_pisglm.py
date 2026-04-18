@@ -580,17 +580,25 @@ class GaussianModel:
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
 
     def execute_sglm_cold_start(self):
-        print("\n[PI-SGLM] Reaching Singularity! 执行计算图物理硬斩断与 DCT 频域冷启动...")
+        print("\n[PI-SGLM] Reaching Singularity! 执行模糊外壳切割与 DCT 频域接管...")
         
-        # 1. 封印规范空间：将前 3000 步收敛出的几何体全部标记为静态，剥离 Autograd 树
-        self._xyz_static = self._xyz.detach().clone()
-        self._features_dc_static = self._features_dc.detach().clone()
-        self._features_rest_static = self._features_rest.detach().clone()
-        self._scaling_static = self._scaling.detach().clone()
-        self._rotation_static = self._rotation.detach().clone()
-        self._opacity_static = self._opacity.detach().clone()
+        # 工业先验：利用空间 Bounding Box 提取机械臂的“模糊运动外壳”
+        # 公子可根据实际场景微调 [-1.0, 1.0] 这个捕获框的大小
+        xyz = self._xyz.detach()
+        mask_x = (xyz[:, 0] > -1.0) & (xyz[:, 0] < 1.0)
+        mask_y = (xyz[:, 1] > -1.0) & (xyz[:, 1] < 1.0)
+        mask_z = (xyz[:, 2] > -1.0) & (xyz[:, 2] < 1.0)
+        dynamic_mask = mask_x & mask_y & mask_z
+        static_mask = ~dynamic_mask
 
-        # 释放 80% 显存压力的核心：斩断反向传播
+        # 1. 静态背景定型与物理剥离
+        self._xyz_static = self._xyz[static_mask].clone()
+        self._features_dc_static = self._features_dc[static_mask].clone()
+        self._features_rest_static = self._features_rest[static_mask].clone()
+        self._scaling_static = self._scaling[static_mask].clone()
+        self._rotation_static = self._rotation[static_mask].clone()
+        self._opacity_static = self._opacity[static_mask].clone()
+
         self._xyz_static.requires_grad_(False)
         self._features_dc_static.requires_grad_(False)
         self._features_rest_static.requires_grad_(False)
@@ -598,25 +606,23 @@ class GaussianModel:
         self._rotation_static.requires_grad_(False)
         self._opacity_static.requires_grad_(False)
 
-        # 2. 动态点冷启动 (抛洒机械臂的初始锚点)
-        num_dynamic = 20000
-        dyn_xyz = torch.rand((num_dynamic, 3), device="cuda") * 2.0 - 1.0 
-        
-        self._xyz_dynamic = nn.Parameter(dyn_xyz.requires_grad_(True))
-        self._features_dc_dynamic = nn.Parameter(torch.zeros((num_dynamic, 1, 3), device="cuda").requires_grad_(True))
-        self._features_rest_dynamic = nn.Parameter(torch.zeros((num_dynamic, 15, 3), device="cuda").requires_grad_(True))
-        self._scaling_dynamic = nn.Parameter(torch.ones((num_dynamic, 3), device="cuda").requires_grad_(True) * -3.0) 
-        self._rotation_dynamic = nn.Parameter(torch.zeros((num_dynamic, 4), device="cuda").requires_grad_(True))
-        self._rotation_dynamic.data[:, 0] = 1.0
-        self._opacity_dynamic = nn.Parameter(torch.zeros((num_dynamic, 1), device="cuda").requires_grad_(True))
+        # 2. 动态点精准继承 (绝对禁止纯随机！直接继承前3000步生成的模糊残影)
+        self._xyz_dynamic = nn.Parameter(self._xyz[dynamic_mask].clone().requires_grad_(True))
+        self._features_dc_dynamic = nn.Parameter(self._features_dc[dynamic_mask].clone().requires_grad_(True))
+        self._features_rest_dynamic = nn.Parameter(self._features_rest[dynamic_mask].clone().requires_grad_(True))
+        self._scaling_dynamic = nn.Parameter(self._scaling[dynamic_mask].clone().requires_grad_(True))
+        self._rotation_dynamic = nn.Parameter(self._rotation[dynamic_mask].clone().requires_grad_(True))
+        self._opacity_dynamic = nn.Parameter(self._opacity[dynamic_mask].clone().requires_grad_(True))
 
-        # 3. 核心：初始化 PI-DCT 频域运动系数矩阵 [N_dyn, K, 3]
+        num_dynamic = self._xyz_dynamic.shape[0]
+
+        # 3. 初始化 PI-DCT 频域矩阵
         self._dct_coefs = nn.Parameter(torch.zeros((num_dynamic, self.K, 3), device="cuda").requires_grad_(True))
 
-        # 4. 重构优化器：仅将动态点和 DCT 系数交由 Adam 追踪
+        # 4. 重构优化器：重火力轰炸 DCT 系数
         l = [
             {'params': [self._xyz_dynamic], 'lr': 0.00016, "name": "xyz"},
-            {'params': [self._dct_coefs], 'lr': 0.001, "name": "dct_coefs"},
+            {'params': [self._dct_coefs], 'lr': 0.003, "name": "dct_coefs"}, # 提高频域收束的学习率
             {'params': [self._features_dc_dynamic], 'lr': 0.0025, "name": "f_dc"},
             {'params': [self._features_rest_dynamic], 'lr': 0.0001, "name": "f_rest"},
             {'params': [self._opacity_dynamic], 'lr': 0.05, "name": "opacity"},
@@ -626,7 +632,7 @@ class GaussianModel:
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         
         self.sglm_activated = True
-        print(f"[PI-SGLM] 物理截断完毕。静态锚点: {self._xyz_static.shape[0]} | DCT 频域节点: {num_dynamic}")
+        print(f"[PI-SGLM] 空间切割完毕。磐石背景: {self._xyz_static.shape[0]} | 继承残影节点: {num_dynamic}")
 
     def compute_dct_deformation(self, t: float):
         # omega_k 频率基：[1*pi, 2*pi, ..., K*pi]
