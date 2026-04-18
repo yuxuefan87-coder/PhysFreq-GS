@@ -222,11 +222,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
         
-        # ========== PI-SGLM: 全域寻迹解锁 ==========
-        # 彻底废除掩码！让 Coarse 阶段看到移动的机械臂，从而在空间中生成一团“模糊的运动外壳”。
-        calc_image = image_tensor
-        calc_gt = gt_image_tensor[:,:3,:,:]
-        
+        # ========== PI-SGLM: 终极解耦寻迹 ==========
+        if stage == "coarse":
+            # 预热期：用掩码彻底遮盖机械臂！建出完美纯净的背景，给机械臂留出一个“黑洞”。
+            masks = [cam.static_mask.cuda() for cam in viewpoint_cams]
+            mask_tensor = torch.cat(masks, 0)
+            calc_image = image_tensor * mask_tensor
+            calc_gt = gt_image_tensor[:,:3,:,:] * mask_tensor
+        else:
+            # 奇点后：放开视野！静态背景已成磐石，新生成的动态点将在“黑洞”里贪婪地拟合机械臂的运动。
+            calc_image = image_tensor
+            calc_gt = gt_image_tensor[:,:3,:,:]
+            
         Ll1 = l1_loss(calc_image, calc_gt)
         psnr_ = psnr(calc_image, calc_gt).mean().double()
         # ============================================
@@ -325,9 +332,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
                     gaussians.grow(5,5,scene.model_path,iteration,stage)
                     # torch.cuda.empty_cache()
-                if iteration % opt.opacity_reset_interval == 0:
-                    print("reset opacity")
-                    gaussians.reset_opacity()
+                # [PI-SGLM 铁律] 绝对禁止在奇点（第3000步）及 Fine 阶段重置透明度！
+                # 否则整个静态背景会变成完全透明的玻璃，并被永远冻结在虚无中！
+                if stage == "coarse" and iteration < 3000:
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
                     
             
 
@@ -396,7 +405,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians,stage=stage, cam_type=dataset_type, *renderArgs)["render"], 0.0, 1.0)
+                    # [PI-SGLM 时钟注入] 测试阶段也必须告诉底层 DCT 算子当前物理时间，否则评价指标将永远静止！
+                    if hasattr(scene.gaussians, 'set_time'):
+                            scene.gaussians.set_time(viewpoint.time)
+                            
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     if dataset_type == "PanopticSports":
                         gt_image = torch.clamp(viewpoint["image"].to("cuda"), 0.0, 1.0)
                     else:
