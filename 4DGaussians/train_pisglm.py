@@ -226,22 +226,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         image_tensor = torch.cat(images,0)
         gt_image_tensor = torch.cat(gt_images,0)
         
-        # ========== PI-SGLM: 终极解耦寻迹 ==========
-        # 提取全局静态遮罩 (背景=1.0, 机械臂=0.0)
-        masks = [cam.static_mask.cuda() for cam in viewpoint_cams]
-        mask_tensor = torch.cat(masks, 0)
+        # ========== PI-SGLM: 全域纯净寻迹 ==========
+        # 没有任何掩码！前 3000 步让模型自由生成致密的背景和机械臂残影。
+        # 奇点之后，由于背景已被物理焊死，Loss 的梯度会自动倾泻到动态机械臂上！
+        calc_image = image_tensor
+        calc_gt = gt_image_tensor[:,:3,:,:]
         
-        if stage == "coarse":
-            # 预热期：只看背景，给机械臂留出一个完美的“黑洞”。
-            calc_image = image_tensor * mask_tensor
-            calc_gt = gt_image_tensor[:,:3,:,:] * mask_tensor
-        else:
-            # 奇点后：反转遮罩！强迫 Loss 100% 聚焦在动态机械臂区域。
-            # 背景已经冻结，不再需要背景的完美像素来稀释宝贵的梯度！
-            dynamic_mask = 1.0 - mask_tensor
-            calc_image = image_tensor * dynamic_mask
-            calc_gt = gt_image_tensor[:,:3,:,:] * dynamic_mask
-            
         Ll1 = l1_loss(calc_image, calc_gt)
         psnr_ = psnr(calc_image, calc_gt).mean().double()
         # ============================================
